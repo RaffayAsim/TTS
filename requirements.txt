@@ -1,0 +1,12 @@
+onnxruntime
+kokoro-onnx
+soundfile
+numpy
+pypdf
+pyloudnorm
+inflect
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+huggingface-hub

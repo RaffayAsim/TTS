@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.onnx
+*.onnx.*
+google_creds.json
+node_modules/
+dist/
+*.zip
+.env*
