@@ -8,6 +8,10 @@ import threading
 import io
 import time
 import tempfile
+import sqlite3
+import uuid
+import shutil
+import traceback
 import urllib.request
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, HTTPServer
@@ -95,12 +99,133 @@ except Exception as e:
     print(f"Error loading Kokoro model: {e}")
     sys.exit(1)
 
-# Supabase Credentials
-SUPABASE_URL = "https://pkjgamlfopaxluzhrvmo.supabase.co"
-# Service role key to bypass RLS and upload/delete files
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBramdhbWxmb3BheGx1emhydm1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MzA5NzUxNSwiZXhwIjoyMDk4NjczNTE1fQ.0K499t1m1kidLV0fnLf32t-rlXn5E7jSlMkQGD91J3k"
+# ------------------ PERSISTENT SQLITE DATABASE & STORAGE ------------------
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+SQLITE_DB_PATH = os.environ.get("SQLITE_DB_PATH", os.path.join(DATA_DIR, "narrator.db"))
+AUDIO_DIR = os.path.join(DATA_DIR, "audiobooks")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+def get_db():
+    conn = sqlite3.connect(SQLITE_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            status TEXT DEFAULT 'pending',
+            voice TEXT DEFAULT 'af_heart',
+            speed REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS chapters (
+            id TEXT PRIMARY KEY,
+            project_name TEXT NOT NULL,
+            chapter_number INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            text TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            audio_url TEXT DEFAULT '',
+            section_type TEXT DEFAULT 'Narrative',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        conn.commit()
+
+init_db()
+
+def db_list_projects():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+def db_get_project(name):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+def db_create_project(name, voice='af_heart', speed=1.0):
+    with get_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO projects (name, voice, speed) VALUES (?, ?, ?)", (name, voice, speed))
+        conn.commit()
+
+def db_update_project(name, fields):
+    if not fields:
+        return
+    keys = list(fields.keys())
+    values = [fields[k] for k in keys]
+    set_clause = ", ".join(f"{k} = ?" for k in keys)
+    with get_db() as conn:
+        conn.execute(f"UPDATE projects SET {set_clause} WHERE name = ?", (*values, name))
+        conn.commit()
+
+def db_delete_project(name):
+    with get_db() as conn:
+        conn.execute("DELETE FROM chapters WHERE project_name = ?", (name,))
+        conn.execute("DELETE FROM projects WHERE name = ?", (name,))
+        conn.commit()
+
+def db_list_chapters(project_name):
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM chapters WHERE project_name = ? ORDER BY chapter_number ASC", (project_name,)).fetchall()
+        return [dict(r) for r in rows]
+
+def db_insert_chapters(project_name, chapters_list):
+    with get_db() as conn:
+        for idx, ch in enumerate(chapters_list):
+            ch_id = ch.get('id') or str(uuid.uuid4())
+            ch_num = ch.get('chapter_number', idx + 1)
+            title = ch.get('title', '')
+            text = ch.get('text', '')
+            section_type = ch.get('section_type') or ch.get('type') or 'Narrative'
+            status = ch.get('status', 'pending')
+            audio_url = ch.get('audio_url', '')
+            conn.execute("""
+            INSERT OR REPLACE INTO chapters (id, project_name, chapter_number, title, text, status, audio_url, section_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ch_id, project_name, ch_num, title, text, status, audio_url, section_type))
+        conn.commit()
+
+def db_add_single_chapter(project_name, title, text):
+    with get_db() as conn:
+        cnt_row = conn.execute("SELECT COUNT(*) FROM chapters WHERE project_name = ?", (project_name,)).fetchone()
+        num = (cnt_row[0] if cnt_row else 0) + 1
+        ch_id = str(uuid.uuid4())
+        conn.execute("""
+        INSERT INTO chapters (id, project_name, chapter_number, title, text, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (ch_id, project_name, num, title, text))
+        conn.commit()
+        return {"id": ch_id, "project_name": project_name, "chapter_number": num, "title": title, "text": text, "status": "pending"}
+
+def db_update_chapter(ch_id, fields):
+    if not fields:
+        return
+    keys = list(fields.keys())
+    values = [fields[k] for k in keys]
+    set_clause = ", ".join(f"{k} = ?" for k in keys)
+    with get_db() as conn:
+        conn.execute(f"UPDATE chapters SET {set_clause} WHERE id = ?", (*values, ch_id))
+        conn.commit()
+
+def db_delete_project_chapters(project_name):
+    with get_db() as conn:
+        conn.execute("DELETE FROM chapters WHERE project_name = ?", (project_name,))
+        conn.commit()
+
+# Optional Supabase credentials from environment (if configured by user)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 def supabase_request(path, method="GET", body=None, headers=None, content_type="application/json", timeout=10):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
     url = f"{SUPABASE_URL}{path}"
     req_headers = {
         "apikey": SUPABASE_KEY,
@@ -110,14 +235,12 @@ def supabase_request(path, method="GET", body=None, headers=None, content_type="
         req_headers["Content-Type"] = content_type
     if headers:
         req_headers.update(headers)
-        
     data = None
     if body is not None:
         if isinstance(body, (dict, list)):
             data = json.dumps(body).encode('utf-8')
         else:
             data = body
-            
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -129,127 +252,59 @@ def supabase_request(path, method="GET", body=None, headers=None, content_type="
             except:
                 return resp_data.decode('utf-8', errors='ignore')
     except Exception as e:
-        print(f"Supabase request error ({method} {path}): {e}")
-        if hasattr(e, 'read'):
-            err_body = e.read().decode('utf-8', errors='ignore')
-            print(f"Error details: {err_body}")
-        raise e
-
-# Verify / Create storage bucket on startup
-try:
-    print("Verifying Supabase Storage bucket 'audiobooks'...")
-    buckets = supabase_request("/storage/v1/bucket")
-    bucket_exists = False
-    if buckets:
-        for b in buckets:
-            if b.get('id') == 'audiobooks':
-                bucket_exists = True
-                break
-    if not bucket_exists:
-        print("Bucket 'audiobooks' not found. Creating public bucket with 1GB limit...")
-        supabase_request("/storage/v1/bucket", method="POST", body={
-            "id": "audiobooks",
-            "name": "audiobooks",
-            "public": True,
-            "file_size_limit": 1000000000
-        })
-        print("Bucket 'audiobooks' successfully created!")
-    else:
-        print("Bucket 'audiobooks' verified. Ensuring generous 1GB size limit...")
-        try:
-            supabase_request("/storage/v1/bucket/audiobooks", method="PUT", body={
-                "id": "audiobooks",
-                "name": "audiobooks",
-                "public": True,
-                "file_size_limit": 1000000000
-            })
-            print("Bucket size limit successfully updated to 1GB!")
-        except Exception as put_err:
-            print(f"Warning: Could not update bucket limit: {put_err}")
-except Exception as e:
-    print(f"Warning: Could not verify/create/update Supabase Storage bucket: {e}")
+        print(f"Supabase request notice ({method} {path}): {e}")
+        return None
 
 def upload_to_storage(project_name, filename, file_bytes):
-    # If Google Drive is configured, upload there instead of Supabase!
+    # 1. Always save locally for instant, zero-latency streaming & synthesis compilation
+    clean_proj = re.sub(r'[\\/*?:"<>|]', "", project_name)
+    proj_dir = os.path.join(AUDIO_DIR, clean_proj)
+    os.makedirs(proj_dir, exist_ok=True)
+    local_path = os.path.join(proj_dir, filename)
+    with open(local_path, 'wb') as f:
+        f.write(file_bytes)
+    
+    # 2. If Google Drive is configured, also upload a cloud backup copy
     if drive_service and GOOGLE_DRIVE_FOLDER_ID:
         try:
-            print(f"Uploading {filename} to Google Drive folder...")
-            # List files in the folder to see if it already exists (upsert)
+            print(f"Backing up {filename} to Google Drive...")
             query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and name = '{filename}' and trashed = false"
             response = drive_service.files().list(q=query, spaces='drive', fields='files(id)').execute()
             files = response.get('files', [])
-            
             media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="audio/mpeg" if filename.endswith(".mp3") else "audio/wav")
-            
             if files:
-                # Update existing file
-                file_id = files[0]['id']
-                file = drive_service.files().update(fileId=file_id, media_body=media).execute()
-                print(f"Successfully updated file in Google Drive: {filename} (ID: {file_id})")
+                drive_service.files().update(fileId=files[0]['id'], media_body=media).execute()
             else:
-                # Create new file
-                file_metadata = {
-                    'name': filename,
-                    'parents': [GOOGLE_DRIVE_FOLDER_ID]
-                }
-                file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                file_id = file.get('id')
-                print(f"Successfully created file in Google Drive: {filename} (ID: {file_id})")
-                
-            # Make the file public so it is streamable
-            try:
-                drive_service.permissions().create(
-                    fileId=file_id,
-                    body={'type': 'anyone', 'role': 'reader'}
-                ).execute()
-            except:
-                pass
-                
-            # Return public link
-            file_info = drive_service.files().get(fileId=file_id, fields='webViewLink').execute()
-            return file_info.get('webViewLink')
+                drive_service.files().create(body={'name': filename, 'parents': [GOOGLE_DRIVE_FOLDER_ID]}, media_body=media, fields='id').execute()
         except Exception as e:
-            print(f"Warning: Google Drive upload failed, falling back to Supabase: {e}")
-
-    # Supabase Fallback
-    path = f"/storage/v1/object/audiobooks/{urllib.parse.quote(project_name)}/{urllib.parse.quote(filename)}"
-    headers = {
-        "x-upsert": "true"
-    }
-    content_type = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
-    supabase_request(path, method="POST", body=file_bytes, headers=headers, content_type=content_type, timeout=600)
-    return f"{SUPABASE_URL}/storage/v1/object/public/audiobooks/{urllib.parse.quote(project_name)}/{urllib.parse.quote(filename)}"
+            print(f"Warning: Google Drive backup notice: {e}")
+            
+    # Return local relative public streaming URL
+    return f"/storage/v1/object/public/audiobooks/{urllib.parse.quote(clean_proj)}/{urllib.parse.quote(filename)}"
 
 def delete_from_storage(project_name, filenames):
     if not filenames:
         return
-        
+    clean_proj = re.sub(r'[\\/*?:"<>|]', "", project_name)
+    proj_dir = os.path.join(AUDIO_DIR, clean_proj)
+    for fn in filenames:
+        fp = os.path.join(proj_dir, fn)
+        if os.path.exists(fp):
+            try:
+                os.remove(fp)
+            except Exception as e:
+                print(f"Warning deleting local file {fp}: {e}")
+                
     if drive_service and GOOGLE_DRIVE_FOLDER_ID:
         try:
-            print(f"Deleting files from Google Drive folder: {filenames}")
-            for filename in filenames:
-                query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and name = '{filename}' and trashed = false"
+            for fn in filenames:
+                query = f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents and name = '{fn}' and trashed = false"
                 response = drive_service.files().list(q=query, spaces='drive', fields='files(id)').execute()
-                files = response.get('files', [])
-                for f in files:
+                for f in response.get('files', []):
                     drive_service.files().delete(fileId=f['id']).execute()
-            print(f"Successfully deleted {len(filenames)} files from Google Drive.")
-            return
         except Exception as e:
-            print(f"Warning: Google Drive delete failed: {e}")
-            
-    # Supabase Fallback
-    path = "/storage/v1/object/audiobooks"
-    prefixes = [f"{project_name}/{f}" for f in filenames]
-    try:
-        supabase_request(path, method="DELETE", body={"prefixes": prefixes})
-        print(f"Successfully deleted {len(filenames)} files from storage for project {project_name}.")
-    except Exception as e:
-        print(f"Warning: Failed to delete files from storage: {e}")
+            print(f"Warning: Google Drive delete notice: {e}")
 
-# ─────────────────────────────────────────────
-# SYSTEM 4: Number & Abbreviation Expander
-# ─────────────────────────────────────────────
 def _num_to_words(n_str):
     """Convert a numeric string to spoken words using inflect, or fall back to digits."""
     try:
@@ -567,18 +622,19 @@ def synthesize_section(text, section_type, voice, speed, sample_rate, project_na
 # Asynchronous Background Synthesis Loop
 # (Systems 1–8 applied)
 # ─────────────────────────────────────────────
+
 def run_automated_synthesis(project_name, voice, speed):
     print(f"Project '{project_name}' queued for synthesis...")
     synthesis_lock.acquire()
     try:
         print(f"Starting automated synthesis for project: {project_name}")
 
-        chapters = supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project_name)}&select=*&order=chapter_number.asc")
+        chapters = db_list_chapters(project_name)
         total_chapters = len(chapters)
 
         if total_chapters == 0:
             print(f"No chapters found for project {project_name}.")
-            supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": "failed"})
+            db_update_project(project_name, {"status": "failed"})
             return
 
         sample_rate = 24000
@@ -607,13 +663,13 @@ def run_automated_synthesis(project_name, voice, speed):
                 section_type = classify_section_type(paragraphs_for_type, ch_title)
 
             if not cleaned_text.strip():
-                supabase_request(f"/rest/v1/chapters?id=eq.{ch_id}", method="PATCH", body={"status": "completed"})
+                db_update_chapter(ch_id, {"status": "completed"})
                 continue
 
-            supabase_request(f"/rest/v1/chapters?id=eq.{ch_id}", method="PATCH", body={"status": "synthesizing"})
+            db_update_chapter(ch_id, {"status": "synthesizing"})
 
             status_text = f"Generating Chapter {ch_num} of {total_chapters} ({section_type})"
-            supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": status_text})
+            db_update_project(project_name, {"status": status_text})
 
             all_samples = []
 
@@ -649,30 +705,42 @@ def run_automated_synthesis(project_name, voice, speed):
                     mp3_bytes = f.read()
                 os.remove(temp_path)
 
-                print(f"Uploading Chapter {ch_num} ({section_type}) audio to Supabase Storage...")
+                print(f"Uploading Chapter {ch_num} ({section_type}) audio to Storage...")
                 audio_url = upload_to_storage(project_name, f"chapter_{ch_num}.mp3", mp3_bytes)
 
-                supabase_request(f"/rest/v1/chapters?id=eq.{ch_id}", method="PATCH", body={
+                db_update_chapter(ch_id, {
                     "status": "completed",
                     "audio_url": audio_url
                 })
 
         # Compile full audiobook
         print(f"Compilation phase: merging all {total_chapters} chapters for project {project_name}...")
-        supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": "combining"})
+        db_update_project(project_name, {"status": "combining"})
 
-        chapters = supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project_name)}&select=*&order=chapter_number.asc")
+        chapters = db_list_chapters(project_name)
 
         all_audio = []
         for ch in chapters:
             url = ch.get('audio_url')
             if url:
-                print(f"Downloading chapter {ch['chapter_number']} for compilation: {url}")
-                with urllib.request.urlopen(url, timeout=600) as response:
-                    audio_bytes = response.read()
-                data, sr = sf.read(io.BytesIO(audio_bytes))
-                all_audio.append(data)
-                all_audio.append(np.zeros(int(sr * 1.5)))
+                print(f"Reading chapter {ch['chapter_number']} for compilation: {url}")
+                audio_bytes = None
+                if url.startswith('/storage/v1/object/public/audiobooks/'):
+                    rel_p = urllib.parse.unquote(url[len('/storage/v1/object/public/audiobooks/'):])
+                    local_p = os.path.join(AUDIO_DIR, os.path.normpath(rel_p).lstrip(r'\/'))
+                    if os.path.exists(local_p):
+                        with open(local_p, 'rb') as f:
+                            audio_bytes = f.read()
+                if not audio_bytes:
+                    try:
+                        with urllib.request.urlopen(url, timeout=600) as response:
+                            audio_bytes = response.read()
+                    except Exception as err:
+                        print(f"Warning: Could not fetch {url}: {err}")
+                if audio_bytes:
+                    data, sr = sf.read(io.BytesIO(audio_bytes))
+                    all_audio.append(data)
+                    all_audio.append(np.zeros(int(sr * 1.5)))
 
         if all_audio:
             all_audio.pop()
@@ -687,25 +755,25 @@ def run_automated_synthesis(project_name, voice, speed):
                 full_bytes = f.read()
             os.remove(full_temp_path)
 
-            print("Uploading full combined MP3 audiobook to Supabase Storage...")
+            print("Uploading full combined MP3 audiobook to Storage...")
             upload_to_storage(project_name, "full_audiobook.mp3", full_bytes)
 
-            # Clean up temporary chapter audio files to save Supabase Storage space
+            # Clean up temporary chapter audio files to save local storage
             try:
                 ch_filenames = [f"chapter_{ch['chapter_number']}.mp3" for ch in chapters]
                 delete_from_storage(project_name, ch_filenames)
             except Exception as clean_err:
                 print(f"Warning: Could not clean up temporary chapters: {clean_err}")
 
-            supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": "completed"})
+            db_update_project(project_name, {"status": "completed"})
             print("Automated synthesis and compilation finished successfully!")
         else:
-            supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": "failed"})
+            db_update_project(project_name, {"status": "failed"})
 
     except Exception as e:
         print(f"Automated synthesis thread failed: {e}")
         try:
-            supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project_name)}", method="PATCH", body={"status": f"failed: {str(e)}"})
+            db_update_project(project_name, {"status": f"failed: {str(e)}"})
         except:
             pass
     finally:
@@ -714,12 +782,13 @@ def run_automated_synthesis(project_name, voice, speed):
         synthesis_lock.release()
         print(f"Project '{project_name}' released from synthesis lock.")
 
+
 class TTSRequestHandler(SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
-        self.send_response(204)
+        self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Range')
         self.end_headers()
 
     def do_POST(self):
@@ -757,13 +826,11 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json_response(500, {'error': str(e)}, origin)
 
         elif self.path == '/api/projects':
-            # Create project in Supabase
             try:
                 content_length = int(self.headers['Content-Length'])
                 post_data = self.rfile.read(content_length)
                 params = json.loads(post_data.decode('utf-8'))
                 name = params.get('name', '').strip()
-                # Clean name: remove carriage returns, newlines, tabs, and collapse spaces
                 name = re.sub(r'\s+', ' ', name).strip()
                 name = re.sub(r'[\\/*?:"<>|]', "", name)
                 
@@ -771,17 +838,16 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                     self.send_json_response(400, {'error': 'Project name is required'}, origin)
                     return
                 
-                # Check if project exists in Supabase
-                check_proj = supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(name)}&select=*")
-                if check_proj and len(check_proj) > 0:
+                check_proj = db_get_project(name)
+                if check_proj:
                     self.send_json_response(400, {'error': 'Project already exists'}, origin)
                     return
                 
-                # Insert into Supabase Projects
-                supabase_request("/rest/v1/projects", method="POST", body={"name": name})
+                db_create_project(name)
                 self.send_json_response(200, {'success': True, 'name': name}, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
+
         elif self.path == '/api/projects/parse-manuscript':
             # SYSTEMS 1, 2, 3, 9, 10 — Intelligent manuscript parser supporting PDF and TXT/Markdown
             try:
@@ -1131,6 +1197,7 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                 self.send_json_response(500, {'error': str(e)}, origin)
 
 
+        
         elif self.path == '/api/projects/import-chapters':
             # Bulk import chapters and trigger synthesis
             try:
@@ -1147,26 +1214,25 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                     self.send_json_response(400, {'error': 'Project and chapters list are required'}, origin)
                     return
                 
-                # Delete existing chapters for this project (atomic wipe)
-                supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project)}", method="DELETE")
+                db_delete_project_chapters(project)
                 
                 db_chapters = []
                 for idx, ch in enumerate(chapters):
                     db_chapters.append({
+                        "id": str(uuid.uuid4()),
                         "project_name": project,
                         "chapter_number": idx + 1,
-                        "title": ch.get('title'),
-                        "text": ch.get('text'),
+                        "title": ch.get('title', ''),
+                        "text": ch.get('text', ''),
                         "section_type": ch.get('section_type') or ch.get('type') or 'Narrative',
                         "status": "pending"
                     })
                 
-                supabase_request("/rest/v1/chapters", method="POST", body=db_chapters)
-                
-                # Update project metadata in Supabase
-                supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project)}", method="PATCH", body={
+                db_insert_chapters(project, db_chapters)
+                db_update_project(project, {
                     "voice": voice,
-                    "speed": speed
+                    "speed": speed,
+                    "status": "pending"
                 })
                 
                 # Start automated sequential synthesis loop on a background thread!
@@ -1193,21 +1259,11 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                     self.send_json_response(400, {'error': 'Project, title, and text are required'}, origin)
                     return
                 
-                # Get current chapter count to determine sequential number
-                exist = supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project)}&select=id")
-                num = len(exist) + 1
-                
-                new_ch = {
-                    "project_name": project,
-                    "chapter_number": num,
-                    "title": title,
-                    "text": text,
-                    "status": "pending"
-                }
-                supabase_request("/rest/v1/chapters", method="POST", body=new_ch)
+                new_ch = db_add_single_chapter(project, title, text)
                 self.send_json_response(200, new_ch, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
+
         elif self.path == '/api/projects/delete':
             try:
                 content_length = int(self.headers['Content-Length'])
@@ -1222,23 +1278,15 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                 print(f"Deleting project {project} records and audio files...")
                 cancelled_projects.add(project)
                 
-                # 1. List and delete files in Supabase Storage under folder 'project/'
                 try:
-                    list_url = f"/storage/v1/object/list/audiobooks"
-                    list_res = supabase_request(list_url, method="POST", body={
-                        "prefix": project,
-                        "limit": 100
-                    })
-                    if isinstance(list_res, list) and len(list_res) > 0:
-                        filenames = [item.get('name') for item in list_res if item.get('name')]
-                        delete_from_storage(project, filenames)
+                    clean_proj = re.sub(r'[\\/*?:"<>|]', "", project)
+                    proj_dir = os.path.join(AUDIO_DIR, clean_proj)
+                    if os.path.exists(proj_dir):
+                        shutil.rmtree(proj_dir, ignore_errors=True)
                 except Exception as storage_err:
                     print(f"Warning: Could not clean up storage files: {storage_err}")
 
-                # 2. Delete database records in Supabase
-                supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project)}", method="DELETE")
-                supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project)}", method="DELETE")
-                
+                db_delete_project(project)
                 self.send_json_response(200, {'success': True, 'message': f'Project {project} deleted successfully.'}, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
@@ -1252,22 +1300,63 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
         
+        # Audio Streaming & Static File Serving
+        if path.startswith('/storage/v1/object/public/audiobooks/') or path.startswith('/api/audio/'):
+            prefix = '/storage/v1/object/public/audiobooks/' if path.startswith('/storage/v1/object/public/audiobooks/') else '/api/audio/'
+            rel_path = urllib.parse.unquote(path[len(prefix):])
+            clean_rel = os.path.normpath(rel_path).lstrip(r'\/')
+            abs_path = os.path.abspath(os.path.join(AUDIO_DIR, clean_rel))
+            
+            if abs_path.startswith(os.path.abspath(AUDIO_DIR)) and os.path.isfile(abs_path):
+                file_size = os.path.getsize(abs_path)
+                content_type = "audio/mpeg" if abs_path.lower().endswith(".mp3") else "audio/wav"
+                
+                range_header = self.headers.get('Range')
+                if range_header:
+                    range_match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+                    if range_match:
+                        start = int(range_match.group(1))
+                        end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+                        length = end - start + 1
+                        self.send_response(206)
+                        self.send_header('Content-Type', content_type)
+                        self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                        self.send_header('Content-Length', str(length))
+                        self.send_header('Accept-Ranges', 'bytes')
+                        self.send_header('Access-Control-Allow-Origin', origin)
+                        self.end_headers()
+                        with open(abs_path, 'rb') as f:
+                            f.seek(start)
+                            self.wfile.write(f.read(length))
+                        return
+
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', origin)
+                self.end_headers()
+                with open(abs_path, 'rb') as f:
+                    self.wfile.write(f.read())
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+
         if path == '/api/projects':
-            # List projects from Supabase
             try:
-                projs = supabase_request("/rest/v1/projects?select=*")
+                projs = db_list_projects()
                 names = [p['name'] for p in projs]
                 self.send_json_response(200, names, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
 
         elif path == '/api/projects/chapters':
-            # List chapters for project sorted strictly by chapter_number
             try:
                 project = query.get('project', [''])[0]
-                chapters = supabase_request(f"/rest/v1/chapters?project_name=eq.{urllib.parse.quote(project)}&select=*&order=chapter_number.asc")
+                chapters = db_list_chapters(project)
                 
-                # Format to match UI expected keys
                 ui_chapters = []
                 for ch in chapters:
                     ui_chapters.append({
@@ -1275,52 +1364,64 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                         'title': f"{ch['chapter_number']}. {ch['title']}",
                         'text': ch['text'],
                         'status': ch['status'],
-                        'audio_path': ch.get('audio_url', '') # Direct Supabase Storage URL
+                        'audio_path': ch.get('audio_url', '')
                     })
                 self.send_json_response(200, ui_chapters, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
 
         elif path == '/api/projects/status':
-            # Retrieve project status (polling status for automated progress board)
             try:
                 project = query.get('project', [''])[0]
-                rows = supabase_request(f"/rest/v1/projects?name=eq.{urllib.parse.quote(project)}&select=*")
-                if rows and len(rows) > 0:
-                    self.send_json_response(200, rows[0], origin)
+                proj = db_get_project(project)
+                if proj:
+                    self.send_json_response(200, proj, origin)
                 else:
                     self.send_json_response(404, {'error': 'Project not found'}, origin)
             except Exception as e:
                 self.send_json_response(500, {'error': str(e)}, origin)
 
         elif path == '/api/system-stats':
+            free_mb = 1024
+            total_mb = 8192
+            mem_percent = 25
             try:
-                out = subprocess.check_output("wmic os get freephysicalmemory, totalvisiblememorysize /format:list", shell=True).decode('utf-8')
-                lines = [l.strip() for l in out.split('\n') if l.strip()]
-                stats = {}
-                for l in lines:
-                    k, v = l.split('=')
-                    stats[k.strip()] = int(v.strip())
-                
-                free_mb = int(stats['FreePhysicalMemory'] / 1024)
-                total_mb = int(stats['TotalVisibleMemorySize'] / 1024)
-                mem_percent = int((1 - (free_mb / total_mb)) * 100)
-                
-                self.send_json_response(200, {
-                    'free_ram_mb': free_mb,
-                    'total_ram_mb': total_mb,
-                    'ram_usage_percent': mem_percent,
-                    'cpu_status': 'Optimized',
-                    'model_loaded': 'Kokoro-82M ONNX'
-                }, origin)
+                # 1. Linux container: inspect /proc/meminfo
+                if os.path.exists('/proc/meminfo'):
+                    mem_info = {}
+                    with open('/proc/meminfo', 'r') as mf:
+                        for line in mf:
+                            parts = line.split(':')
+                            if len(parts) == 2:
+                                mem_info[parts[0].strip()] = int(parts[1].strip().split()[0])
+                    if 'MemTotal' in mem_info:
+                        total_mb = mem_info['MemTotal'] // 1024
+                        avail = mem_info.get('MemAvailable', mem_info.get('MemFree', 0))
+                        free_mb = avail // 1024
+                        mem_percent = int(((total_mb - free_mb) / total_mb) * 100) if total_mb > 0 else 25
+                elif sys.platform == 'win32':
+                    out = subprocess.check_output("wmic os get freephysicalmemory, totalvisiblememorysize /format:list", shell=True).decode('utf-8')
+                    lines = [l.strip() for l in out.split('\n') if l.strip()]
+                    stats = {}
+                    for l in lines:
+                        if '=' in l:
+                            k, v = l.split('=', 1)
+                            stats[k.strip()] = int(v.strip())
+                    if 'FreePhysicalMemory' in stats and 'TotalVisibleMemorySize' in stats:
+                        free_mb = int(stats['FreePhysicalMemory'] / 1024)
+                        total_mb = int(stats['TotalVisibleMemorySize'] / 1024)
+                        mem_percent = int((1 - (free_mb / total_mb)) * 100) if total_mb > 0 else 25
             except Exception as e:
-                self.send_json_response(200, {
-                    'free_ram_mb': 675,
-                    'total_ram_mb': 8042,
-                    'ram_usage_percent': 91,
-                    'cpu_status': 'Optimized',
-                    'model_loaded': 'Kokoro-82M ONNX'
-                }, origin)
+                pass
+
+            self.send_json_response(200, {
+                'free_ram_mb': free_mb,
+                'total_ram_mb': total_mb,
+                'ram_usage_percent': mem_percent,
+                'cpu_status': 'Optimized',
+                'model_loaded': 'Kokoro-82M ONNX'
+            }, origin)
+
         elif path == '/favicon.ico':
             self.send_response(200)
             self.send_header('Content-Type', 'image/x-icon')
@@ -1342,20 +1443,13 @@ def run():
     httpd = HTTPServer(server_address, TTSRequestHandler)
     print(f"Web interface running at: http://localhost:{PORT}")
     
-    # Auto-resume any unfinished projects
+    # Auto-reset any unfinished projects from prior unexpected container exit
     try:
-        unfinished = supabase_request("/rest/v1/projects?or=(status.ilike.Generating%25,status.eq.combining,status.ilike.failed%25)")
-        if unfinished:
-            for proj in unfinished:
-                name = proj['name']
-                voice = proj.get('voice', 'af_heart')
-                speed = proj.get('speed', 1.0)
-                print(f"Auto-resuming unfinished project: {name} (voice={voice}, speed={speed}x)")
-                thread = threading.Thread(target=run_automated_synthesis, args=(name, voice, speed))
-                thread.daemon = True
-                thread.start()
+        with get_db() as conn:
+            conn.execute("UPDATE projects SET status = 'failed' WHERE status LIKE 'Generating%' OR status = 'combining'")
+            conn.commit()
     except Exception as e:
-        print("Warning: Could not auto-resume unfinished projects:", e)
+        print("Notice on project cleanup:", e)
         
     try:
         httpd.serve_forever()
