@@ -1868,7 +1868,7 @@
                             <h3 style="font-size:1.3rem; font-weight:800; color:#6ee7b7; margin-bottom:10px; display:flex; align-items:center; gap:8px;">
                                 <span>🎉</span> Compiled Audiobook Output
                             </h3>
-                            <p style="color:var(--text-muted); font-size:0.95rem; margin-bottom:20px;">Your full audiobook has been compiled and uploaded to Supabase Storage successfully!</p>
+                            <p style="color:var(--text-muted); font-size:0.95rem; margin-bottom:20px;">Your full audiobook has been compiled and uploaded to Storage successfully!</p>
                             <div id="combineResult" style="padding-top: 25px; border-top: 1px dashed rgba(255,255,255,0.1);">
                                 <audio id="fullAudioPlayer" controls style="max-width: 500px; margin: 0 auto 20px auto; display: block;"></audio>
                                 <a id="fullDownloadLink" href="#" download="audiobook.mp3" class="download-link" style="display:inline-flex; width:auto; margin:0 auto; display:block; text-align:center;">
@@ -1922,7 +1922,7 @@
     </style>
 
     <script>
-        const SUPABASE_URL = "https://pkjgamlfopaxluzhrvmo.supabase.co";
+        const SUPABASE_URL = "";
         // List of Voice Profiles
         const VOICE_PROFILES = [
             { id: "af_heart", name: "Heart", accent: "US Female narrator", tag: "female", desc: "Warm, natural, and expressive. Perfect for long audiobooks." },
@@ -2122,7 +2122,9 @@
             try {
                 const projResp = await fetch('/api/projects');
                 const projects = await projResp.json();
-                statProjects.textContent = projects.length;
+                if (Array.isArray(projects)) {
+                    statProjects.textContent = projects.length;
+                }
             } catch (err) {
                 console.error(err);
             }
@@ -2421,7 +2423,7 @@
                         
                         globalProgressPercent.textContent = '100%';
                         globalProgressBarFill.style.width = '100%';
-                        globalStatusMessage.textContent = "Audiobook compiled successfully! Audio files uploaded to Supabase storage.";
+                        globalStatusMessage.textContent = "Audiobook compiled successfully! Audio files uploaded to Storage successfully.";
                         
                         loadChapters();
                         loadFullAudiobookPlayer();
@@ -2464,12 +2466,16 @@
                 const projects = await response.json();
                 
                 projectSelect.innerHTML = '<option value="" disabled selected>Choose a project...</option>';
-                projects.forEach(p => {
-                    const opt = document.createElement('option');
-                    opt.value = p;
-                    opt.textContent = p;
-                    projectSelect.appendChild(opt);
-                });
+                if (Array.isArray(projects)) {
+                    projects.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p;
+                        opt.textContent = p;
+                        projectSelect.appendChild(opt);
+                    });
+                } else if (projects && projects.error) {
+                    showError(`Projects notice: ${projects.error}`);
+                }
 
                 if (activeProject) projectSelect.value = activeProject;
             } catch (err) {
@@ -2525,7 +2531,7 @@
 
         async function deleteActiveProject() {
             if (!activeProject) return;
-            if (!confirm(`Are you absolutely sure you want to delete the project "${activeProject}"? This will permanently wipe all database records and delete all compiled audio files from Supabase Storage.`)) {
+            if (!confirm(`Are you absolutely sure you want to delete the project "${activeProject}"? This will permanently wipe all database records and delete all compiled audio files.`)) {
                 return;
             }
 
