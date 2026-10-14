@@ -625,8 +625,10 @@ def synthesize_section(text, section_type, voice, speed, sample_rate, project_na
 
 def run_automated_synthesis(project_name, voice, speed):
     print(f"Project '{project_name}' queued for synthesis...")
+    cancelled_projects.discard(project_name)
     synthesis_lock.acquire()
     try:
+        cancelled_projects.discard(project_name)
         print(f"Starting automated synthesis for project: {project_name}")
 
         chapters = db_list_chapters(project_name)
@@ -843,6 +845,7 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                     self.send_json_response(400, {'error': 'Project already exists'}, origin)
                     return
                 
+                cancelled_projects.discard(name)
                 db_create_project(name)
                 self.send_json_response(200, {'success': True, 'name': name}, origin)
             except Exception as e:
@@ -1171,12 +1174,17 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                 # ─────────────────────────────────────────────
                 final_sections = []
                 for sec in cleaned_sections:
-                    if sec['word_count'] >= 30 or sec['type'] in ('Poem', 'Dialogue'):
+                    if sec['word_count'] >= 25 or sec['type'] in ('Poem', 'Dialogue'):
                         final_sections.append(sec)
                     else:
                         if final_sections:
                             final_sections[-1]['text'] += '\n\n' + sec['text']
                             final_sections[-1]['word_count'] = len(final_sections[-1]['text'].split())
+                        else:
+                            final_sections.append(sec)
+
+                if not final_sections and cleaned_sections:
+                    final_sections = cleaned_sections
 
                 # Re-classify poem sections that were merged into front matter
                 for sec in final_sections:
@@ -1236,6 +1244,7 @@ class TTSRequestHandler(SimpleHTTPRequestHandler):
                 })
                 
                 # Start automated sequential synthesis loop on a background thread!
+                cancelled_projects.discard(project)
                 thread = threading.Thread(target=run_automated_synthesis, args=(project, voice, speed))
                 thread.daemon = True
                 thread.start()
